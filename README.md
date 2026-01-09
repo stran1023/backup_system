@@ -15,8 +15,9 @@ Hệ thống sao lưu dòng lệnh (CLI) đảm bảo:
 - Python 3.13+
 - Linux
 
-### Bước 1: Tải file zip và giải nén
+### Bước 1: Clone code
 ```bash
+git clone https://github.com/stran1023/backup_system.git
 cd backup_system
 ```
 
@@ -47,9 +48,6 @@ nano policy.yaml  # Sửa 'sonchan' thành username thực
 ```bash
 # Hiển thị help
 python main.py --help
-
-# Test toàn bộ test suite
-pytest tests/ -v
 ```
 
 ## Các lệnh CLI đầy đủ
@@ -63,8 +61,6 @@ python main.py restore <snapshot_id> <target>   # Khôi phục
 
 # Audit & Security
 python main.py audit-verify                     # Xác minh audit log
-python main.py audit-show [--limit N]           # Hiển thị audit log
-python main.py tamper-test                      # Test tamper detection
 ```
 
 ## 🏗️ Cấu trúc dữ liệu
@@ -188,50 +184,113 @@ Genesis (0*64) → snap1_root → snap2_root → snap3_root
 ```
 
 #### 3. Kiểm tra rollback:
-- Mỗi Merkle root chỉ xuất hiện 1 lần trong chain
-- Nếu root cũ xuất hiện sau root mới → rollback
-- Chain phải liên tục (không đứt đoạn)
+Hệ thống sử dụng **hash chain** để phát hiện rollback. Mỗi snapshot chứa:
+- `prev_root`: merkle_root của snapshot trước đó
+- `prev_chain_hash`: chain_hash của snapshot trước đó  
+- `chain_hash`: SHA256(prev_chain_hash + merkle_root + prev_root)
 
 ### Triển khai trong code
 ```python
 # metadata.json
 {
   "snapshots": {
-    "snap_1": {
-      "merkle_root": "root1",
-      "prev_root": "0"*64,
-      "created_at": 1700000000
+    "snap_1767963569_b6c9e1eb": {
+      "id": "snap_1767963569_b6c9e1eb",
+      "created_at": 1767963569.642924,
+      "label": "before-rollback",
+      "merkle_root": "e45ce75f4fd996a8c27d4055cb906d7b48f319702057624c4acfb493677524f1",
+      "prev_root": "0000000000000000000000000000000000000000000000000000000000000000",
+      "prev_chain_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "chain_hash": "65e9ce5e1af15abaa4d6ab8629f1222e72fdb15826724bf2094b5ec48b333629",
+      "manifest_hash": "59a077f60f958d4b034a31c778f1495024832859662ebaa8809e86014212803c",
+      "total_files": 114,
+      "total_chunks": 316,
+      "sequence": 0
     },
-    "snap_2": {
-      "merkle_root": "root2", 
-      "prev_root": "root1",
-      "created_at": 1700000100
+    "snap_1767963570_b0e73103": {
+      "id": "snap_1767963570_b0e73103",
+      "created_at": 1767963571.0239656,
+      "label": "after-rollback",
+      "merkle_root": "e45ce75f4fd996a8c27d4055cb906d7b48f319702057624c4acfb493677524f1",
+      "prev_root": "e45ce75f4fd996a8c27d4055cb906d7b48f319702057624c4acfb493677524f1",
+      "prev_chain_hash": "65e9ce5e1af15abaa4d6ab8629f1222e72fdb15826724bf2094b5ec48b333629",
+      "chain_hash": "8400a9306567f3cf14bced31633c13e69c8ea58387cdede15f9d547eca42404d",
+      "manifest_hash": "ffcf9480ec80783f70d536c4432f56b728af4fa788d5747b3d4d9aa3d46c71cb",
+      "total_files": 114,
+      "total_chunks": 316,
+      "sequence": 1
     }
   },
-  "prev_root_chain": ["root1", "root2"],
-  "latest_snapshot": "snap_2"
+  "latest_snapshot": "snap_1767963570_b0e73103",
+  "prev_root_chain": [
+    "e45ce75f4fd996a8c27d4055cb906d7b48f319702057624c4acfb493677524f1",
+    "e45ce75f4fd996a8c27d4055cb906d7b48f319702057624c4acfb493677524f1"
+  ],
+  "latest_snapshot_root": "e45ce75f4fd996a8c27d4055cb906d7b48f319702057624c4acfb493677524f1"
 }
 ```
 
-### Test rollback detection
+### Reproduce rollback detection
 ```bash
-# 1. Tạo 2 snapshots liên tiếp
-echo "Version 1" > testfile.txt
-python main.py backup ./test_dataset --label "v1"
+# Tạo thư mục test
+mkdir -p test_rollback_dataset
 
-echo "Version 2" > testfile.txt  
-python main.py backup ./test_dataset --label "v2"
+# Tạo file test
+cp dataset test_rollback_dataset
 
-# 2. Lấy snapshot IDs
+# Khởi tạo backup store
+python main.py init ./test_rollback_store
+
+# Snapshot 1
+python main.py backup ./test_rollback_dataset --label "snapshot-1"
+
+# Thay đổi content
+echo "Version 2 - Modified content" > test_rollback_dataset/testfile.txt
+
+# Snapshot 2
+python main.py backup ./test_rollback_dataset --label "snapshot-2"
+
+# Liệt kê snapshots
 python main.py list
 
-# 3. Thủ công thay metadata (simulate rollback)
-# Tìm file: store/metadata.json
-# Thay merkle_root của snap2 bằng merkle_root của snap1
+# Xem metadata
+cat ./test_rollback_store/metadata.json | python -m json.tool
 
-# 4. Verify sẽ phát hiện
-python main.py verify <snapshot_id>
-# Kết quả: ✗ Rollback detected
+# Hoặc tìm snapshot IDs
+grep -n "snap_" ./test_rollback_store/metadata.json
+
+# Backup metadata trước khi sửa
+cp ./test_rollback_store/metadata.json ./test_rollback_store/metadata.json.backup
+
+# Mở metadata để sửa
+nano ./test_rollback_store/metadata.json
+hoặc dùng sed/trực tiếp trong editor
+
+# Thực hiện các thay đổi sau trong metadata.json:
+# Tìm metadata của snapshot mới nhất (snapshot thứ 2)
+# Sửa các trường sau:
+{
+  "prev_root": "0000000000000000000000000000000000000000000000000000000000000000",
+  "prev_chain_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+}
+
+# Thay <snapshot2_id> bằng ID thực tế
+python main.py verify <snapshot2_id>
+
+# Kết quả mong đợi:
+# ✗ Snapshot <id> is INVALID
+#   Reason: Rollback detected: Previous snapshot not found for root: 00000000...
+# hoặc
+#   Reason: Rollback detected: Hash chain mismatch with previous snapshot
+
+# Khôi phục metadata gốc
+cp ./test_rollback_store/metadata.json.backup ./test_rollback_store/metadata.json
+
+# Verify lại snapshot (phải PASS)
+python main.py verify <snapshot2_id>
+
+# Tạo snapshot mới (hệ thống vẫn hoạt động)
+python main.py backup ./test_rollback_dataset --label "after-rollback-test"
 ```
 
 ## 💾 Crash Consistency (Journal/WAL)
@@ -240,10 +299,8 @@ python main.py verify <snapshot_id>
 #### Cấu trúc WAL:
 ```text
 BEGIN:snap_123
-ADD_CHUNK:hash1
-ADD_CHUNK:hash2
-ADD_MANIFEST:manifest_hash
-SET_METADATA:snap_123:merkle_root:prev_root:timestamp:label
+MANIFEST:manifest_hash
+METADATA:snap_123:merkle_root:prev_root:timestamp:label
 COMMIT:snap_123
 ```
 
@@ -262,23 +319,25 @@ def recover():
         WAL vẫn nhất quán
 ```
 
-### Test crash recovery
+### Reproduce crash recovery
 ```bash
-# 1. Tạo dataset lớn để backup lâu
-dd if=/dev/urandom of=large_dataset.bin bs=1M count=50
+python main.py init ./test_store
 
-# 2. Bắt đầu backup và kill process
-python main.py backup ./large_dataset --label "Crash Test" &
+# Chạy backup và kill giữa chừng
+python main.py backup ./dataset --label "interrupted" &
 BACKUP_PID=$!
-sleep 1  # Đợi backup bắt đầu
-kill -9 $BACKUP_PID
+sleep 2  # Chờ backup bắt đầu xử lý
+kill -9 $BACKUP_PID  # SIGKILL mô phỏng crash
 
-# 3. Kiểm tra store vẫn nhất quán
-python main.py init ./store  # Sẽ thông báo recovery
-# Output: "Recovered from crash. Cleaned up incomplete snapshots: [...]"
+# 4. Kiểm tra recovery
+python main.py list
+# Kết quả mong đợi:
+# - Không có snapshot nào với label "interrupted" trong list
+# - Có thể có message recovery trong output
+# - Không có corrupt snapshots
 
-# 4. Verify không có snapshot lỗi
-python main.py list  # Chỉ snapshots hợp lệ
+# 5. Tạo backup mới (hệ thống vẫn hoạt động)
+python main.py backup ./dataset --label "after-crash"
 ```
 
 ## 👥 Policy Enforcement
@@ -337,9 +396,9 @@ def check_permission(user, command):
 whoami
 
 # 2. Test các lệnh theo role
-python main.py init ./store      # Chỉ admin được
-python main.py list              # Tất cả roles được
-python main.py backup ./data     # Admin & operator được
+python main.py init ./store         # Chỉ admin được
+python main.py list                 # Tất cả roles được
+python main.py backup ./dataset     # Admin & operator được
 
 # 3. Test DENY case (tạm sửa policy.yaml)
 # Thêm user với role auditor, thử chạy backup
@@ -454,45 +513,26 @@ sudo python main.py init ./store
 ```
 
 ## 🧪 Kiểm thử
-### Chạy toàn bộ test suite
-```bash
-# Chạy all tests
-python -m pytest tests/ -v
+### Chạy test case
+```python
+# 1. Xoá một số file từ source, restore từ snapshot và so sánh kết quả (cây thư mục + nội dung file).
+python tests/test_delete_restore.py
 
-# Kết quả mong đợi:
-# 26 passed, 4 warnings in X.XXs
-```
+# 2. Sửa tối thiểu 1 byte trong chunk; verify phải fail.
+python tests/test_tamper_chunk.py
 
-### Test cases bao gồm
-1. ✅ Backup/restore correctness
-2. ✅ Integrity verification (tamper detection)
-3. ✅ Rollback detection
-4. ✅ Crash recovery
-5. ✅ Policy enforcement
-6. ✅ Audit log tamper detection
-7. ✅ Merkle tree computation
+#3. Sửa manifest/metadata; verify phải fail.
+python tests/test_tamper_manifest.py
 
-### Test manual checklist
-```bash
-# 1. Init & backup
-python main.py init ./test_store
-python main.py backup ./test_data --label "Test1"
+# 4. Rollback: thay snapshot mới bằng snapshot cũ; sau đó chương trình phải phát hiện được.
+python tests/test_rollback.py
 
-# 2. List & verify
-python main.py list
-python main.py verify <snapshot_id>
+# 5. Kill chương trình giữa lúc backup; lần chạy sau không được có snapshot lỗi và store vẫn hoạt động.
+python tests/test_crash.py
 
-# 3. Restore
-mkdir restored
-python main.py restore <snapshot_id> ./restored
+# 6. Policy: chạy một lệnh không được phép dựa theo role của OS user hiện tại và phải bị từ chối và có audit log DENY.
+python tests/test_policy.py
 
-# 4. Audit log
-python main.py audit-verify
-python main.py audit-show --limit 5
-
-# 5. Policy test
-# Sửa policy.yaml, test DENY case
-
-# 6. Crash test
-# Kill process during backup, verify recovery
+# 7. Audit: sửa 1 ký tự trong audit.log hoặc xoá 1 dòng; audit-verify phải báo AUDIT CORRUPTED.
+python tests/test_audit.py
 ```

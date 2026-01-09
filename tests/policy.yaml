@@ -1,0 +1,28 @@
+users:
+  # Test user with limited role (auditor)
+  sonchan: auditor
+  
+  # System users
+  root: admin
+  admin: admin
+
+roles:
+  admin:
+    - init
+    - backup
+    - list-snapshots
+    - verify
+    - restore
+    - audit-verify
+  
+  operator:
+    - backup
+    - list-snapshots
+    - verify
+    - restore
+    - audit-verify
+  
+  auditor:
+    - list-snapshots
+    - verify
+    - audit-verify

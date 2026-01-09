@@ -1,0 +1,5 @@
+# Config files
+backup_config.json
+
+# Backup stores (tùy chọn)
+store/

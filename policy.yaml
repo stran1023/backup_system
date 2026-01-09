@@ -1,5 +1,4 @@
 users:
-  # EXAMPLE USERS - EDIT THESE LINES!
   # Change 'sonchan' to your actual OS username
   sonchan: admin        # ← CHANGE 'sonchan' TO YOUR USERNAME
   bob: operator       # ← CHANGE 'bob' IF NEEDED

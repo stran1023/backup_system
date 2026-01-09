@@ -34,13 +34,20 @@ def compute_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 def read_file_in_chunks(file_path: str, chunk_size: int = CHUNK_SIZE):
-    """Generator to read file in chunks"""
-    with open(file_path, 'rb') as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            yield chunk
+    """Generator to read file in chunks - ĐẢM BẢO trả về bytes"""
+    try:
+        with open(file_path, 'rb') as f:  # ← 'rb' để đọc binary
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                # ĐẢM BẢO chunk là bytes
+                if not isinstance(chunk, bytes):
+                    chunk = bytes(chunk)
+                yield chunk
+    except Exception as e:
+        print(f"Error reading file {file_path}: {e}")
+        raise
 
 def ensure_dir(directory: str) -> None:
     """Ensure directory exists"""

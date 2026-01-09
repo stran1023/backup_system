@@ -13,15 +13,9 @@ sys.path.insert(0, current_dir)
 try:
     from src.cli import BackupCLI
 except ImportError:
-    # Thử cách khác nếu cần
-    try:
-        # Thử import trực tiếp nếu đang ở trong src
-        import cli
-        BackupCLI = cli.BackupCLI
-    except ImportError:
-        print("Cannot import modules. Make sure you're in the right directory.")
-        print("Current directory:", current_dir)
-        sys.exit(1)
+    print("Cannot import modules. Make sure you're in the right directory.")
+    print("Current directory:", current_dir)
+    sys.exit(1)
 
 def main():
     """Main function"""

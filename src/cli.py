@@ -5,12 +5,14 @@ import argparse
 import sys
 import os
 import time
+import hashlib
+import json
 from typing import List
 from .storage import ChunkStorage, SnapshotManager
 from .journal import Journal
 from .policy import PolicyManager
 from .audit import AuditLogger
-from .utils import get_os_user, ensure_dir
+from .utils import get_os_user, ensure_dir, canonical_json, compute_hash
 from .exceptions import PolicyDeniedError, IntegrityError, SnapshotNotFoundError
 
 class BackupCLI:
@@ -24,41 +26,82 @@ class BackupCLI:
         self.policy_manager = None
         self.audit_logger = None
         self.current_user = None
-    
+        self._load_store_config()
+
+    def _load_store_config(self):
+        """Load store path from config file if exists"""
+        config_file = os.path.join(os.path.dirname(__file__), "..", "backup_config.json")
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'r') as f:
+                    config = json.load(f)
+                    store_path = config.get("store_path")
+                    if store_path and os.path.exists(store_path):
+                        print(f"Auto-loaded store from config: {store_path}")
+                        self._setup_components(store_path)
+            except Exception as e:
+                print(f"Warning: Could not load config: {e}")
+
+    def _save_store_config(self, store_path: str):
+        """Save store path to config file"""
+        config_file = os.path.join(os.path.dirname(__file__), "..", "backup_config.json")
+        try:
+            with open(config_file, 'w') as f:
+                json.dump({"store_path": os.path.abspath(store_path)}, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Could not save config: {e}")
+
     def _ensure_initialized(self) -> None:
         """Ensure system is initialized"""
         if not self.store_path or not self.storage:
-            raise ValueError("Backup store not initialized. Run 'init' first.")
-    
+            # THỬ LOAD LẠI TỪ CONFIG
+            self._load_store_config()
+
+            # Nếu vẫn không có
+            if not self.store_path or not self.storage:
+                raise ValueError(
+                    "Backup store not initialized. Run 'init' first.\n"
+                    "Example: python main.py init ./store"
+                )
+            
+        # ĐẢM BẢO current_user được set
+        if not hasattr(self, 'current_user') or self.current_user is None:
+            try:
+                self.current_user = get_os_user()
+            except ValueError as e:
+                raise ValueError(f"Cannot determine OS user: {e}")
+            
     def _setup_components(self, store_path: str) -> None:
-        """Setup all components for a store"""
-        self.store_path = os.path.abspath(store_path)
-        ensure_dir(self.store_path)
+        """Setup all components with automatic recovery"""
+        self.store_path = store_path
         
-        # Initialize components
+        # Tạo journal TRƯỚC
+        journal_path = os.path.join(self.store_path, "journal.wal")
+        self.journal = Journal(journal_path)
+        
+        # Tạo storage và snapshot manager (tự động recovery)
         self.storage = ChunkStorage(self.store_path)
-        self.snapshot_manager = SnapshotManager(self.storage)
-        self.journal = Journal(os.path.join(self.store_path, "journal.wal"))
+        self.snapshot_manager = SnapshotManager(self.storage, self.journal)
         
-        # Policy and audit
+        # Policy và audit
         policy_path = os.path.join(os.path.dirname(__file__), "..", "policy.yaml")
         self.policy_manager = PolicyManager(policy_path)
         
         audit_log_path = os.path.join(self.store_path, "audit.log")
         self.audit_logger = AuditLogger(audit_log_path)
-        
-        # Get current user
-        try:
-            self.current_user = get_os_user()
-        except ValueError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
     
     def _audit_and_enforce(self, command: str, args: List[str], 
-                          func, *func_args, **func_kwargs):
+                        func, *func_args, **func_kwargs):
         """
         Wrapper to enforce policy and audit commands
         """
+        # Đảm bảo current_user được set
+        if not self.current_user:
+            try:
+                self.current_user = get_os_user()
+            except:
+                self.current_user = "unknown"
+        
         try:
             # Check permission
             self.policy_manager.enforce_permission(command, self.current_user)
@@ -74,79 +117,146 @@ class BackupCLI:
             return result
             
         except PolicyDeniedError as e:
-            # Log denial
+            # Log denial - ĐẢM BẢO current_user không None
+            user_for_log = self.current_user if self.current_user else "unknown"
             self.audit_logger.log_command(
-                self.current_user, command, args, "DENY", str(e)
+                user_for_log, command, args, "DENY", str(e)
             )
             print(f"Permission denied: {e}")
-            return None
+            sys.exit(1)
             
         except Exception as e:
             # Log failure
+            user_for_log = self.current_user if self.current_user else "unknown"
             self.audit_logger.log_command(
-                self.current_user, command, args, "FAIL", str(e)
+                user_for_log, command, args, "FAIL", str(e)
             )
             print(f"Command failed: {e}")
-            return None
-    
+            sys.exit(1)
+
     def init(self, store_path: str) -> None:
         """Initialize a new backup store"""
+        # 1. Get user FIRST
+        try:
+            self.current_user = get_os_user()
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        
+        # 2. Check permission using temporary policy
+        policy_path = os.path.join(os.path.dirname(__file__), "..", "policy.yaml")
+        temp_policy = PolicyManager(policy_path)
+        
+        # Audit log tạm nếu cần (không có store nên không ghi được)
+        if not temp_policy.check_permission("init", self.current_user):
+            print(f"Permission denied: User '{self.current_user}' cannot run 'init'")
+            sys.exit(1)
+        
+        # 3. Check directory
+        store_path = os.path.abspath(store_path)
         if os.path.exists(store_path) and os.listdir(store_path):
             response = input(f"Directory '{store_path}' is not empty. Continue? (y/N): ")
             if response.lower() != 'y':
                 print("Initialization cancelled.")
                 return
         
+        # 4. Setup store directory
+        ensure_dir(store_path)
+        
+        # 5. CHỈ tạo Journal và recovery TRƯỚC
+        journal = Journal(os.path.join(store_path, "journal.wal"))
+        incomplete = journal.recover()
+        if incomplete:
+            print(f"Recovered from crash. Cleaned incomplete: {incomplete}")
+        
+        store_path = os.path.abspath(store_path)
+
+        # 6. Bây giờ mới setup components đầy đủ
         self._setup_components(store_path)
         
-        # Run crash recovery
-        incomplete_snapshots = self.journal.recover()
-        if incomplete_snapshots:
-            print(f"Recovered from crash. Cleaned up incomplete snapshots: {incomplete_snapshots}")
-        self.journal.mark_recovery_complete()
+        # LƯU CONFIG SAU KHI THÀNH CÔNG
+        self._save_store_config(store_path)
+
+        # 7. Ghi audit log
+        self.audit_logger.log_command(
+            self.current_user, "init", [store_path], "OK"
+        )
         
         print(f"Initialized backup store at: {store_path}")
+        print(f"Config saved to: backup_config.json")
         print(f"Current user: {self.current_user}")
-    
+        
     def backup(self, source_path: str, label: str = "") -> None:
         """Create a backup snapshot"""
+        # Kiểm tra initialization
         self._ensure_initialized()
         
-        source_path = os.path.abspath(source_path)
-        if not os.path.exists(source_path):
-            print(f"Error: Source path does not exist: {source_path}")
+        # Kiểm tra policy TRƯỚC
+        try:
+            self._audit_and_enforce("backup", [source_path, f"--label {label}" if label else ""],
+                                self._backup_internal, source_path, label)
+        except Exception as e:
+            print(f"Backup failed: {e}")
             return
+
+    def _backup_internal(self, source_path: str, label: str = "") -> None:
+        """Internal backup implementation (after policy check)"""
+        source_path = os.path.abspath(source_path)
+        
+        # Kiểm tra source path
+        if not os.path.exists(source_path):
+            raise ValueError(f"Source path does not exist: {source_path}")
+        
+        if not os.access(source_path, os.R_OK):
+            raise ValueError(f"Cannot read source path: {source_path}")
         
         print(f"Creating backup of: {source_path}")
         if label:
             print(f"Label: {label}")
         
-        # Start journal transaction
-        snapshot_id = f"snap_{int(time.time())}"
+        # Tạo snapshot ID
+        snapshot_id = f"snap_{int(time.time())}_{hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:8]}"
+        
+        # Bắt đầu WAL transaction
         self.journal.begin_transaction(snapshot_id)
         
         try:
-            # Create snapshot
+            # Tạo snapshot (gọi phiên bản có journal)
+            # CHÚ Ý: SnapshotManager cần được khởi tạo với journal
             metadata = self.snapshot_manager.create_snapshot(source_path, label)
             
-            # Journal updates
-            self.journal.set_metadata(
-                metadata["id"],
-                metadata["merkle_root"],
-                metadata["prev_root"],
-                metadata["created_at"],
-                label
-            )
-            self.journal.commit(metadata["id"])
+            # KHÔNG CẦN GỌI journal.add_manifest ở đây nữa
+            # vì SnapshotManager.create_snapshot đã xử lý journaling
             
-            print(f"Backup created successfully!")
-            print(f"Snapshot ID: {metadata['id']}")
-            print(f"Merkle Root: {metadata['merkle_root'][:16]}...")
-            print(f"Files: {metadata['total_files']}, Chunks: {metadata['total_chunks']}")
+            # In kết quả
+            print(f"✓ Backup created successfully!")
+            print(f"  Snapshot ID: {metadata['id']}")
+            print(f"  Merkle Root: {metadata['merkle_root'][:16]}...")
+            print(f"  Files: {metadata['total_files']}, Chunks: {metadata['total_chunks']}")
             
         except Exception as e:
+            # Rollback trong WAL
             self.journal.abort(snapshot_id)
-            raise e
+            
+            # Clean up any partial files
+            self._cleanup_failed_backup(snapshot_id)
+            
+            # Re-raise với context
+            raise RuntimeError(f"Backup failed for {source_path}: {str(e)}") from e
+
+    def _cleanup_failed_backup(self, snapshot_id: str) -> None:
+        """Clean up files from failed backup"""
+        try:
+            # Xóa manifest file nếu tồn tại
+            manifest_path = os.path.join(self.store_path, "snapshots", f"{snapshot_id}.manifest")
+            if os.path.exists(manifest_path):
+                os.remove(manifest_path)
+            
+            # Note: Không xóa chunks vì chúng có thể được dùng bởi snapshot khác
+            # Chunks được deduplicated nên safe
+            
+        except Exception as e:
+            print(f"Warning: Error during cleanup: {e}")
     
     def list_snapshots(self) -> None:
         """List all snapshots"""
@@ -289,13 +399,7 @@ class BackupCLI:
         
         # Audit commands
         subparsers.add_parser("audit-verify", help="Verify audit log integrity")
-        audit_show_parser = subparsers.add_parser("audit-show", help="Show audit log")
-        audit_show_parser.add_argument("--limit", type=int, default=20, 
-                                      help="Number of entries to show")
-        
-        # Tamper test
-        subparsers.add_parser("tamper-test", help="Test audit log tamper detection")
-        
+    
         args = parser.parse_args()
         
         if not args.command:
@@ -310,8 +414,6 @@ class BackupCLI:
             "verify": self.verify,
             "restore": self.restore,
             "audit-verify": self.audit_verify,
-            "audit-show": lambda: self.show_audit_log(args.limit if hasattr(args, 'limit') else 20),
-            "tamper-test": "tamper-test"
         }
         
         # Execute command
@@ -319,8 +421,7 @@ class BackupCLI:
             if args.command == "init":
                 self.init(args.store_path)
             elif args.command == "backup":
-                self._audit_and_enforce("backup", [args.source_path, f"--label {args.label}" if args.label else ""],
-                                       self.backup, args.source_path, args.label)
+                self.backup(args.source_path, args.label)
             elif args.command == "list":
                 self._audit_and_enforce("list-snapshots", [],
                                        self.list_snapshots)
@@ -333,13 +434,6 @@ class BackupCLI:
             elif args.command == "audit-verify":
                 self._audit_and_enforce("audit-verify", [],
                                        self.audit_verify)
-            elif args.command == "audit-show":
-                self.show_audit_log(args.limit)
-            elif args.command == "tamper-test":
-                if hasattr(self, 'audit_logger') and self.audit_logger:
-                    self.audit_logger.tamper_test()
-                else:
-                    print("Error: System not initialized. Run 'init' first.")
             else:
                 print(f"Unknown command: {args.command}")
                 
